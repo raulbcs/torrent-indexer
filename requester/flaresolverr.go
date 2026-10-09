@@ -255,7 +255,13 @@ func (f *FlareSolverr) Get(ctx context.Context, _url string, attempts int) (io.R
 		"cmd":        "request.get",
 		"url":        _url,
 		"maxTimeout": f.maxTimeout,
-		"session":    session,
+	}
+	// "dumb-session" is a placeholder minted when FlareSolverr does not support
+	// sessions.list (trawl). Sending it would pin every request to a single
+	// shared browser context, which Cloudflare eventually poisons — leaving it
+	// out makes trawl spawn a fresh context per request instead.
+	if session != "" && session != "dumb-session" {
+		body["session"] = session
 	}
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
