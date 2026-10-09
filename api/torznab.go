@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/leandrotsampa/torrent-indexer/consts"
 	"github.com/leandrotsampa/torrent-indexer/logging"
@@ -466,6 +467,10 @@ func newTorznabItem(def torznabIndexer, it schema.IndexedTorrent) torznabItem {
 
 	if !it.Date.IsZero() {
 		item.PubDate = it.Date.UTC().Format(torznabDateLayout)
+	} else {
+		// Prowlarr exige pubDate válido em todo item; indexers sem data na
+		// página (ex.: starckfilmesnet) usam agora como fallback
+		item.PubDate = time.Now().UTC().Format(torznabDateLayout)
 	}
 	if it.MagnetLink != "" {
 		item.Enclosure = &torznabEnclosure{
