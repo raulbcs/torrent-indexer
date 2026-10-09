@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -67,6 +68,9 @@ var (
 	bludvNonWordRE             = regexp.MustCompile(`[^a-z0-9]+`)
 	bludvAnchorRE              = regexp.MustCompile(`(?is)<a(?:\s[^>]*?)?\shref\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>`)
 	bludvSystemAdsHrefRE       = regexp.MustCompile(`(?i)systemads\d*\.[a-z]+/go\.php`)
+	bludvGateHrefRE            = regexp.MustCompile(`(?i)href="[^"]*/gate/go/[0-9a-f]+\?p=(\d+)[^"]*"`)
+	bludvRestMagnetRE          = regexp.MustCompile(`(?i)href="(magnet:\?[^"]+)"`)
+	bludvRawMagnetRE           = regexp.MustCompile(`magnet:\?xt=urn:btih:[a-zA-Z0-9]+(?:&[a-zA-Z0-9%._~+-]*)*`)
 	bludvHTMLTagRE             = regexp.MustCompile(`(?is)<[^>]+>`)
 	bludvSubtitleSeparatorRE   = regexp.MustCompile(`[:|–]|\s-\s`)
 	bludvLineBreakTagRE        = regexp.MustCompile(`(?is)<br\s*/?>|</(?:p|div|li|tr|h[1-6])>`)
@@ -945,6 +949,59 @@ func extractBluDVMagnetLinks(ctx context.Context, i *Indexer, content *goquery.S
 	return links
 }
 
+// bludvMagnetLinksFromWPPost resolves the magnet links for posts whose only
+// download anchor is the site's /gate/go/ ad gateway ("Magnet-Link" button).
+// The gateway itself is a multi-hop ad funnel that cannot be walked headlessly,
+// but the WordPress REST API exposes the raw post content with the plain
+// magnet links, bypassing the gateway entirely.
+func bludvMagnetLinksFromWPPost(ctx context.Context, i *Indexer, content *goquery.Selection, referer string) ([]bludvMagnetLink, bool) {
+	htmlContent, err := content.Html()
+	if err != nil {
+		return nil, false
+	}
+	m := bludvGateHrefRE.FindStringSubmatch(htmlContent)
+	if m == nil {
+		return nil, false
+	}
+	postID := m[1]
+
+	restURL := strings.TrimRight(bludv.URL, "/") + "/wp-json/wp/v2/posts/" + postID
+	resp, err := i.requester.GetDocument(ctx, restURL, referer)
+	if err != nil {
+		logging.Warn().Err(err).Str("url", restURL).Msg("BluDV: failed to fetch WP REST post")
+		return nil, false
+	}
+	defer resp.Close()
+	body, err := io.ReadAll(resp)
+	if err != nil {
+		return nil, false
+	}
+
+	var links []bludvMagnetLink
+	var post struct {
+		Content struct {
+			Rendered string `json:"rendered"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(body, &post) == nil && post.Content.Rendered != "" {
+		for _, match := range bludvRestMagnetRE.FindAllStringSubmatch(post.Content.Rendered, -1) {
+			links = append(links, bludvMagnetLink{URL: html.UnescapeString(match[1])})
+		}
+	} else {
+		// body was not clean JSON (e.g. wrapped in HTML by the browser);
+		// fall back to a raw scan and HTML-entity unescape
+		for _, raw := range bludvRawMagnetRE.FindAllString(string(body), -1) {
+			links = append(links, bludvMagnetLink{URL: html.UnescapeString(raw)})
+		}
+	}
+	if len(links) == 0 {
+		logging.Warn().Str("url", restURL).Msg("BluDV: WP REST post has no magnets")
+		return nil, false
+	}
+	logging.Debug().Str("url", restURL).Int("magnets", len(links)).Msg("BluDV: resolved magnets via WP REST")
+	return links, true
+}
+
 func isBluDVDownloadHref(href string) bool {
 	return strings.HasPrefix(href, "magnet:") ||
 		bludvSystemAdsHrefRE.MatchString(href) ||
@@ -1022,6 +1079,13 @@ func getTorrentsBluDV(ctx context.Context, i *Indexer, link, referer string) ([]
 	textContent := article.Find("div.content")
 	date := getPublishedDate(doc)
 	magnetLinks := extractBluDVMagnetLinks(ctx, i, textContent, link)
+	if len(magnetLinks) == 0 {
+		// newer posts hide every download behind the /gate/go/ ad gateway;
+		// resolve them through the WordPress REST API instead
+		if wpLinks, ok := bludvMagnetLinksFromWPPost(ctx, i, textContent, link); ok {
+			magnetLinks = wpLinks
+		}
+	}
 
 	var audio []schema.Audio
 	var year string
